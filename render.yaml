@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: unified-webhook-agent
+    env: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: SHARED_TOKEN
+        generateValue: true
+      - key: AGENT_FORWARD_URL
+        value: ""
+      - key: FORWARD_HMAC_SECRET
+        value: ""
