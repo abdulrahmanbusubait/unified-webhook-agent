@@ -1,48 +1,75 @@
-
+# main.py
+import os
 from fastapi import FastAPI, Request, HTTPException
-import os, time, json, hmac, hashlib
+from pydantic import BaseModel
+import httpx
 
-app = FastAPI(title="Unified Webhook Agent")
+SHARED_TOKEN = os.getenv("SHARED_TOKEN", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# بيئة العمل
-SHARED_TOKEN = os.getenv("SHARED_TOKEN", "CHANGE_ME")
-AGENT_FORWARD_URL = os.getenv("AGENT_FORWARD_URL", "")
-FORWARD_HMAC_SECRET = os.getenv("FORWARD_HMAC_SECRET", "")
+app = FastAPI()
 
-def sign(secret: str, body: bytes) -> str:
-    return hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+class Alert(BaseModel):
+    # الحقول الشائعة التي ترسلها TradingView (أي حقل إضافي سيتجاهله الموديل تلقائياً)
+    symbol: str | None = None
+    price: str | float | None = None
+    time: str | None = None
+    exchange: str | None = None
+    interval: str | None = None
+    kind: str | None = None
+    type: str | None = None
+    label: str | None = None
+    v: int | None = None
+    note: str | None = None
+    # حقول اختيارية لأهداف/وقف إن أرسلتها لاحقاً
+    sl: float | None = None
+    tp1: float | None = None
+    tp2: float | None = None
+
+def format_message(a: Alert) -> str:
+    dir_map = {"BUY": "شراء", "SELL": "بيع"}
+    head = f"🚨 إشارة {dir_map.get(str(a.type).upper(), a.type)}" if a.type else "🚨 تنبيه"
+    lines = [head]
+    if a.symbol:   lines.append(f"📈 الرمز: {a.symbol}")
+    if a.exchange: lines.append(f"🏦 السوق: {a.exchange}")
+    if a.interval: lines.append(f"⏱ الإطار: {a.interval}")
+    if a.price is not None: lines.append(f"💵 السعر: {a.price}")
+    if a.time:     lines.append(f"🕒 الوقت: {a.time}")
+    if a.note:     lines.append(f"📝 ملاحظة: {a.note}")
+    # أهداف ووقف (اختياري)
+    extras = []
+    if a.sl is not None:  extras.append(f"⛔️ وقف: {a.sl}")
+    if a.tp1 is not None: extras.append(f"🎯 هدف1: {a.tp1}")
+    if a.tp2 is not None: extras.append(f"🎯 هدف2: {a.tp2}")
+    if extras: lines.append(" — ".join(extras))
+    return "\n".join(lines)
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "time": int(time.time())}
+    return {"status": "ok"}
 
-@app.post("/webhook/tv")
-async def tv(request: Request):
-    token = request.query_params.get("token")
-    if token != SHARED_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+@app.post("/webhook")
+async def webhook(request: Request, tok: str):
+    # تحقق من التوكِن الممرَّر في رابط الويبهوك ?tok=
+    if tok != SHARED_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
 
-    raw_body = await request.body()
-    content_type = request.headers.get("content-type","")
-
+    data = await request.json()
     try:
-        body = json.loads(raw_body.decode("utf-8")) if "json" in content_type else {"message": raw_body.decode("utf-8")}
+        alert = Alert(**data) if isinstance(data, dict) else Alert()
     except Exception:
-        body = {"message": raw_body.decode("utf-8", errors="ignore")}
+        alert = Alert()
 
-    event = {"received_at": int(time.time()), "source": "tradingview", "payload": body}
+    text = format_message(alert)
 
-    os.makedirs("logs", exist_ok=True)
-    with open("logs/events.log", "a", encoding="utf-8") as f:
-        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    # إرسال إلى تيليجرام (إن كانت المتغيرات مضبوطة)
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID and text:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML",
+                   "disable_web_page_preview": True}
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(url, data=payload)
 
-    if AGENT_FORWARD_URL:
-        import httpx
-        headers = {"content-type": "application/json"}
-        data = json.dumps(event, ensure_ascii=False).encode("utf-8")
-        if FORWARD_HMAC_SECRET:
-            headers["X-Signature"] = sign(FORWARD_HMAC_SECRET, data)
-        async with httpx.AsyncClient(timeout=30) as client:
-            await client.post(AGENT_FORWARD_URL, content=data, headers=headers)
-        return {"ok": True, "forwarded": True}
-    return {"ok": True, "forwarded": False}
+    # استجابة نجاح لـ TradingView
+    return {"ok": True}
