@@ -1,75 +1,135 @@
-# main.py
-import os
-from fastapi import FastAPI, Request, HTTPException
-from pydantic import BaseModel
-import httpx
+# ========= Agent helpers =========
 
-SHARED_TOKEN = os.getenv("SHARED_TOKEN", "")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+from typing import Dict, Any, List, Optional
+from datetime import datetime, timezone
 
-app = FastAPI()
+# إعدادات بسيطة قابلة للتعديل عبر Environment لاحقًا
+RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))      # 1% افتراضيًا
+DEFAULT_RR      = float(os.getenv("DEFAULT_RR", "1.5"))          # المخاطرة للعائد
+MAIN_REF        = os.getenv("MAIN_REF_SYMBOL", "SPCUSD")         # مرجع التحليل (SPC)
 
-class Alert(BaseModel):
-    # الحقول الشائعة التي ترسلها TradingView (أي حقل إضافي سيتجاهله الموديل تلقائياً)
-    symbol: str | None = None
-    price: str | float | None = None
-    time: str | None = None
-    exchange: str | None = None
-    interval: str | None = None
-    kind: str | None = None
-    type: str | None = None
-    label: str | None = None
-    v: int | None = None
-    note: str | None = None
-    # حقول اختيارية لأهداف/وقف إن أرسلتها لاحقاً
-    sl: float | None = None
-    tp1: float | None = None
-    tp2: float | None = None
+# ذاكرة قصيرة لحفظ آخر التوصيات (تعرض في /report)
+RECENT_SIGNALS: List[Dict[str, Any]] = []
 
-def format_message(a: Alert) -> str:
-    dir_map = {"BUY": "شراء", "SELL": "بيع"}
-    head = f"🚨 إشارة {dir_map.get(str(a.type).upper(), a.type)}" if a.type else "🚨 تنبيه"
-    lines = [head]
-    if a.symbol:   lines.append(f"📈 الرمز: {a.symbol}")
-    if a.exchange: lines.append(f"🏦 السوق: {a.exchange}")
-    if a.interval: lines.append(f"⏱ الإطار: {a.interval}")
-    if a.price is not None: lines.append(f"💵 السعر: {a.price}")
-    if a.time:     lines.append(f"🕒 الوقت: {a.time}")
-    if a.note:     lines.append(f"📝 ملاحظة: {a.note}")
-    # أهداف ووقف (اختياري)
-    extras = []
-    if a.sl is not None:  extras.append(f"⛔️ وقف: {a.sl}")
-    if a.tp1 is not None: extras.append(f"🎯 هدف1: {a.tp1}")
-    if a.tp2 is not None: extras.append(f"🎯 هدف2: {a.tp2}")
-    if extras: lines.append(" — ".join(extras))
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+def _float(x: Any) -> Optional[float]:
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+def base_rules(alert: Alert) -> Dict[str, Any]:
+    """
+    قواعد خفيفة تولّد اتجاه وثقة مبنية على:
+    - النوع القادم من TradingView (BUY/SELL أو signal عام)
+    - سياق الرمز المرجعي SPC إذا وصلتنا إشاراته (من آخر RECENT_SIGNALS)
+    - فريم الإشارة
+    """
+    symbol = (alert.symbol or "").upper()
+    direction = None
+    confidence = 50
+
+    # 1) من TradingView — لو الإشارة صريحة (BUY/SELL)
+    raw = (alert.type or "").lower()
+    if "buy" in raw:
+        direction = "LONG"
+        confidence = 60
+    elif "sell" in raw:
+        direction = "SHORT"
+        confidence = 60
+
+    # 2) تحيز مرجعي من SPC إذا توفر آخر اتجاه له
+    def last_dir(sym: str) -> Optional[str]:
+        for r in reversed(RECENT_SIGNALS):
+            if r.get("symbol") == sym:
+                return r.get("direction")
+        return None
+
+    spc_dir = last_dir(MAIN_REF)
+    if spc_dir:
+        # لو الرمز الحالي ليس SPC، نعزز/نخفّض الثقة حسب توافقه معه
+        if symbol != MAIN_REF and direction:
+            if (spc_dir == "LONG" and direction == "LONG") or (spc_dir == "SHORT" and direction == "SHORT"):
+                confidence += 10
+            else:
+                confidence -= 10
+
+    # 3) fallback: لو مافيه اتجاه واضح، نعطي "Neutral" بثقة منخفضة
+    if not direction:
+        direction = "NEUTRAL"
+        confidence = 40
+
+    # 4) قص الثقة لمدى [10..90]
+    confidence = max(10, min(90, confidence))
+
+    return {"direction": direction, "confidence": confidence}
+
+def risk_plan(alert: Alert, rules: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    توليد خطة تداول رقمية سريعة:
+    - الدخول = سعر الإغلاق الحالي
+    - الوقف = 0.35% عكس الاتجاه (قابل للتعديل)
+    - الهدف = RR * المسافة
+    """
+    price = _float(alert.price)
+    if price is None or price <= 0:
+        return {"entry": None, "sl": None, "tp": None, "rr": DEFAULT_RR}
+
+    direction = rules["direction"]
+    rr = DEFAULT_RR
+    stop_pct = 0.0035  # 0.35% افتراضيًا
+
+    if direction == "LONG":
+        sl = price * (1 - stop_pct)
+        tp = price + (price - sl) * rr
+    elif direction == "SHORT":
+        sl = price * (1 + stop_pct)
+        tp = price - (sl - price) * rr
+    else:
+        sl = None
+        tp = None
+
+    return {"entry": price, "sl": sl, "tp": tp, "rr": rr}
+
+def build_recommendation(alert: Alert) -> Dict[str, Any]:
+    rules = base_rules(alert)
+    plan  = risk_plan(alert, rules)
+
+    rec = {
+        "ts": _now_iso(),
+        "symbol": (alert.symbol or "").upper(),
+        "interval": alert.interval,
+        "direction": rules["direction"],
+        "confidence": rules["confidence"],
+        "entry": plan["entry"],
+        "sl": plan["sl"],
+        "tp": plan["tp"],
+        "rr": plan["rr"],
+        "note": "Auto-generated by Agent v1 (rules-based)."
+    }
+    return rec
+
+def fmt_telegram_table(rec: Dict[str, Any]) -> str:
+    def f(x, d=2):
+        return f"{x:.{d}f}" if isinstance(x, (int, float)) else "-"
+    lines = [
+        f"📈 *{rec['symbol']}*  |  ⏱ {rec.get('interval','-')}  |  {rec['ts']}",
+        f"• Direction: *{rec['direction']}*  |  Confidence: *{rec['confidence']}%*",
+        f"• Entry: *{f(rec['entry'])}*  |  SL: *{f(rec['sl'])}*  |  TP: *{f(rec['tp'])}*  |  RR: {rec['rr']}",
+        f"• Note: {rec['note']}"
+    ]
     return "\n".join(lines)
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-@app.post("/webhook")
-async def webhook(request: Request, tok: str):
-    # تحقق من التوكِن الممرَّر في رابط الويبهوك ?tok=
-    if tok != SHARED_TOKEN:
-        raise HTTPException(status_code=401, detail="unauthorized")
-
-    data = await request.json()
+async def send_to_telegram(text: str) -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
     try:
-        alert = Alert(**data) if isinstance(data, dict) else Alert()
-    except Exception:
-        alert = Alert()
-
-    text = format_message(alert)
-
-    # إرسال إلى تيليجرام (إن كانت المتغيرات مضبوطة)
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID and text:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML",
-                   "disable_web_page_preview": True}
         async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(url, data=payload)
+            await client.post(url, json=payload)
+    except Exception:
+        pass
 
-    # استجابة نجاح لـ TradingView
-    return {"ok": True}
