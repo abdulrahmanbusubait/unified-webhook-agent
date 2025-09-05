@@ -1,173 +1,119 @@
-# ================= Webhook (Production) =================
-from typing import Optional, Dict, Any
-import os
-import json
-import httpx
-from fastapi import FastAPI, Request, HTTPException
-from pydantic import BaseModel
-
-# --- إعدادات خارجية ---
-OPENAI_URL   = "https://api.openai.com/v1/chat/completions"
-OPENAI_MODEL = "gpt-4o-mini"  # سريع ورخيص نسبياً
-
-# حتى نظهر سعر "SPC" (المؤشر الذي تعتمد عليه) بصورة موحّدة:
-SPC_ALIASES = {"SPC", "SPCUSD", "SPCUSD/US DOLLAR", "SPCUSD/US DOLLAR - E"}
-
-# --- متغيرات البيئة ---
-SHARED_TOKEN      = os.getenv("SHARED_TOKEN", "")
-TELEGRAM_BOT_TOKEN= os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
-OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
-
-app = FastAPI()
-
-# للصحة
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
-# نموذج التنبيه القادم من TradingView
-class Alert(BaseModel):
-    symbol: Optional[str] = None
-    price: Optional[float] = None
-    interval: Optional[str] = None
-    time: Optional[str] = None
-
-def normalize_symbol(sym: Optional[str]) -> str:
-    if not sym:
-        return "UNKNOWN"
-    s = sym.strip().upper()
-    # لو أحد الاشتقاقات المعروفة لـ SPC
-    if s in SPC_ALIASES or s.startswith("SPCUSD"):
-        return "SPC"
-    return s
-
-def build_prompt(alert: Alert) -> str:
-    """
-    نُلزم ChatGPT أن يرجّع JSON منظّم فقط.
-    يعتمد على السعر المرسل من TradingView (وهو نفس الذي يظهر على الشارت).
-    """
-    sym = normalize_symbol(alert.symbol)
-    price = alert.price if alert.price is not None else "NA"
-    interval = alert.interval or "NA"
-    t = alert.time or "NA"
-
-    return f"""
-أنت محلل أسواق محترف. قيم الوضع الحالي بدقة واعطِ توصية "آمنة فقط" إن وُجدت.
-أعد الإجابة في صيغة JSON **فقط** (لا تضف نصاً خارج JSON) بالشكل التالي تماماً:
-
-{{
-  "send": true|false,            // هل نرسل توصية الآن؟
-  "reason": "لماذا/ملخص قصير",
-  "trend": "صاعد|هابط|عرضي",
-  "action": "BUY|SELL|WAIT",
-  "entry":  {{"min": number, "max": number}},   // نطاق دخول آمن
-  "sl":     number,                              // وقف خسارة
-  "tp1":    number,                              // هدف 1
-  "tp2":    number,                              // هدف 2 (اختياري)
-  "confidence": 0-100                            // ثقة القرار
-}}
-
-شروط الأمان:
-- لا توصي إن كان الاتجاه غير واضح أو المخاطر مرتفعة (اجعل send=false).
-- إن كانت التوصية آمنة فعلاً (send=true) ضع نطاق دخول معقول SL/TP مناسبين.
-- لا تخرج عن هيكل JSON المذكور.
-
-المدخلات:
-- الرمز: {sym}
-- السعر الحالي: {price}
-- الإطار الزمني: {interval}
-- الوقت: {t}
-    """.strip()
-
-async def call_openai(prompt: str) -> Dict[str, Any]:
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": OPENAI_MODEL,
-        # نضمن رجوع JSON فقط
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": "أنت خبير تحليل أسواق مالية."},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.2
-    }
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(OPENAI_URL, headers=headers, json=payload)
-        r.raise_for_status()
-        data = r.json()
-        content = data["choices"][0]["message"]["content"]
-        # المحتوى يعود JSON نصي؛ نحوله لقاموس
-        return json.loads(content)
-
-def format_telegram_message(alert: Alert, res: Dict[str, Any]) -> str:
-    sym = normalize_symbol(alert.symbol)
-    price = alert.price if alert.price is not None else "NA"
-    interval = alert.interval or "NA"
-    trend = res.get("trend", "-")
-    action = res.get("action", "WAIT")
-    entry = res.get("entry", {})
-    entry_min = entry.get("min", "-")
-    entry_max = entry.get("max", "-")
-    sl = res.get("sl", "-")
-    tp1 = res.get("tp1", "-")
-    tp2 = res.get("tp2", "-")
-    conf = res.get("confidence", "-")
-    reason = res.get("reason", "-")
-
-    return (
-        f"📊 *Unified Signal*\n"
-        f"• Symbol: *{sym}*    | Frame: *{interval}*\n"
-        f"• Price: *{price}*\n"
-        f"• Trend: *{trend}*\n"
-        f"• Action: *{action}*\n"
-        f"• Entry: *{entry_min} - {entry_max}*\n"
-        f"• SL: *{sl}*   | TP1: *{tp1}*   | TP2: *{tp2}*\n"
-        f"• Confidence: *{conf}%*\n"
-        f"• Note: {reason}"
-    )
-
-async def send_telegram(text: str):
-    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
-    async with httpx.AsyncClient(timeout=20) as client:
-        await client.post(url, json=payload)
-
 @app.post("/webhook")
-async def webhook(alert: Alert, request: Request):
-    # التحقق من التوكِن
+async def webhook(alert: Dict[str, Any], request: Request):
+    # تحقق من التوكن
     token = request.query_params.get("token")
     if token != SHARED_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # نبني مُدخل التحليل
-    prompt = build_prompt(alert)
+    # ---------- Helpers ----------
+    def norm_sym(s: str) -> str:
+        if not s: return ""
+        s = s.upper().strip()
+        # تطبيع الأسماء الشائعة
+        aliases = {
+            "SPCUSD": "SPC",
+            "SPC": "SPC",
+            "SPCUSD/US DOLLAR": "SPC",
+            "ESU2025": "ES",
+            "ES": "ES",
+            "SPX": "SPX",
+            "SPY": "SPY",
+            "DX1!": "DX1!",
+            "DXY": "DX1!",
+            "VX1!": "VX1!",
+            "VIX": "VX1!",
+        }
+        return aliases.get(s, s)
 
-    # استدعاء ChatGPT مع JSON إلزامي
+    def to_float(x):
+        # يدعم نصًا/رقمًا/نطاق "6484-6488" ⇒ منتصف النطاق
+        if x is None: return None
+        if isinstance(x, (int, float)): return float(x)
+        s = str(x).replace(",", "").strip()
+        # نطاقات
+        for sep in ["-", "–", "—", " to ", "–", "—"]:
+            if sep in s:
+                try:
+                    a, b = s.split(sep)[0].strip(), s.split(sep)[-1].strip()
+                    return (float(a) + float(b)) / 2.0
+                except:
+                    pass
+        # قيمة مفردة
+        try: return float(s)
+        except: return None
+
+    def pick_first(*keys):
+        for k in keys:
+            v = alert.get(k)
+            if v not in (None, ""): return v
+        return None
+
+    # ---------- قراءة الحقول ----------
+    raw_symbol = pick_first("symbol", "ticker", "s", "S")
+    symbol = norm_sym(raw_symbol or "")
+
+    interval = pick_first("interval", "timeframe", "tf", "Interval") or ""
+    price    = to_float(pick_first("price", "close", "p", "Price"))
+
+    # اتجاه الإشارة من أي حقل محتمل
+    text_all = " ".join([str(v) for v in alert.values() if isinstance(v, (str,int,float))]).lower()
+    recommendation = (pick_first("recommendation","signal","type","position","dir") or "").lower()
+
+    def is_buy(txt):  # يدعم عربي/إنجليزي
+        return any(w in txt for w in ["buy","long","شراء","طويل"])
+    def is_sell(txt):
+        return any(w in txt for w in ["sell","short","بيع","قصير"])
+
+    direction = ""
+    if is_buy(recommendation) or is_buy(text_all): direction = "BUY"
+    if is_sell(recommendation) or is_sell(text_all): direction = "SELL"
+
+    # SL / TP يمكن أن تأتي بعدة مسميات
+    sl  = to_float(pick_first("sl","stop","stop_loss","وقف","وقف_الخسارة","SL"))
+    tp1 = to_float(pick_first("tp1","target1","tp","tp_1","الهدف","الهدف_الأول","TP1"))
+    tp2 = to_float(pick_first("tp2","target2","tp_2","الهدف_الثاني","TP2"))
+
+    # هل مذكور أنها آمنة؟ (نصًا أو بوجود SL وTP)
+    label_note = (pick_first("label","note","comment","Message") or "").lower()
+    is_safe = any(w in label_note for w in ["safe","آمنة","مفعل"]) or (sl and tp1)
+
+    # نرفض إن لم تكن توصية قابلة للتنفيذ
+    if symbol not in {"SPC","ES","SPX","SPY","DX1!","VX1!"} or direction == "" or not is_safe:
+        return {"status":"ignored"}
+
+    # تقدير entry: من price أو mid-range المدخل أو أول نطاق دخول إن وجد
+    entry = to_float(pick_first("entry","entry_price","منطقة_الدخول","zone","الدخول","entryZone")) or price
+
+    # إن لم توجد SL/TP نحاول توليدها تحفظيًا من ATR/VWAP (اختياري):
+    if (not sl or not tp1):
+        # انحرافات تحفظية بسيطة حول السعر الحالي عند غياب المستويات
+        # (يمكنك تحسينها لاحقًا بالدمج مع مؤشراتك عبر الحقول المرسلة)
+        step = max(2.0, (price or 0) * 0.002)  # ~0.2%
+        if direction == "BUY":
+            sl  = sl  or round((price or entry) - 3*step, 2)
+            tp1 = tp1 or round((price or entry) + 3*step, 2)
+            tp2 = tp2 or round(tp1 + 3*step, 2)
+        else:
+            sl  = sl  or round((price or entry) + 3*step, 2)
+            tp1 = tp1 or round((price or entry) - 3*step, 2)
+            tp2 = tp2 or round(tp1 - 3*step, 2)
+
+    # صياغة ملخّص موجز
+    title = f"{symbol} — توصية آمنة"
+    line  = f"{direction} | دخول: {entry} | SL: {sl} | TP1: {tp1} | TP2: {tp2} | الفريم: {interval or 'n/a'}"
+
+    # أولوية SPC: لو هذه إشارة أسهم وتتعارض مع SPC الحديثة، يمكن هنا تطبيق منطق التعارض إن رغبت
+    # (اختياري: حافظ على ذاكرة آخر SPC في متغير عالمي/كاش ووسم إشارات الأسهم بانتظار عند التعارض)
+
+    # إرسال لتيليجرام فقط عندما تكون الإشارة آمنة
     try:
-        ai = await call_openai(prompt)
-    except Exception as e:
-        # لا نُسقط الخادم — نعيد ردّاً مفيداً
-        return {"status": "error", "where": "openai", "detail": str(e)}
+        tg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        await httpx.AsyncClient(timeout=10).post(tg_url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": f"📌 {title}\n{line}",
+            "parse_mode": "HTML"
+        })
+    except Exception:
+        pass
 
-    # نرسل للتيليجرام فقط لو send=true
-    send_flag = bool(ai.get("send", False))
-    if send_flag:
-        msg = format_telegram_message(alert, ai)
-        try:
-            await send_telegram(msg)
-        except Exception as e:
-            return {"status": "error", "where": "telegram", "detail": str(e)}
-
-    # استجابة الـ webhook
-    return {
-        "status": "ok",
-        "normalized_symbol": normalize_symbol(alert.symbol),
-        "sent": send_flag,
-        "ai": ai,   # مفيد للفحص
-    }
+    return {"status":"ok","symbol":symbol,"direction":direction,"safe":True}
